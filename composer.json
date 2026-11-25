@@ -1,0 +1,31 @@
+{
+    "name": "owner888/php-http",
+    "description": "Zero-dependency pure-PHP 8.3+ async event loop (stream_select / Io\\Poll + Fibers), non-blocking DNS/TLS sockets, HTTP/1.1 & HTTP/2 client (ALPN, HPACK, connection pools, gzip, HTTP/SOCKS5 proxies), and WebSocket client.",
+    "type": "library",
+    "keywords": ["http", "http2", "hpack", "async", "fiber", "websocket", "proxy", "socks5", "stream-select"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "owner888",
+            "homepage": "https://github.com/owner888"
+        }
+    ],
+    "require": {
+        "php": ">=8.3",
+        "ext-openssl": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0 || ^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Owner888\\Async\\": "src/Async/",
+            "Owner888\\Http\\": "src/Http/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Owner888\\Http\\Test\\": "tests/"
+        }
+    }
+}

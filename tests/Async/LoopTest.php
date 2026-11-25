@@ -1,0 +1,594 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Owner888\Http\Test\Async;
+
+use PHPUnit\Framework\Attributes\DataProvider;
+use Owner888\Async\AsyncError;
+use Owner888\Async\Loop;
+use PHPUnit\Framework\TestCase;
+use Owner888\Http\Test\AssertsThrows;
+use RuntimeException;
+use Throwable;
+
+final class LoopTest extends TestCase
+{
+    use AssertsThrows;
+
+    #[\Override]
+    protected function setUp(): void
+    {
+        Loop::reset();
+    }
+
+    public function testDeferredCallbacksRunInOrderOnTheNextTick(): void
+    {
+        $loop = Loop::get();
+        $order = [];
+
+        $loop->defer(function () use (&$order): void {
+            $order[] = 'first';
+        });
+        $loop->defer(function () use (&$order): void {
+            $order[] = 'second';
+        });
+
+        $this->assertSame([], $order);
+
+        $loop->tick();
+
+        $this->assertSame(['first', 'second'], $order);
+    }
+
+    public function testACallbackThatDefersDoesNotStarveTheSameTick(): void
+    {
+        $loop = Loop::get();
+        $ticks = 0;
+
+        $loop->defer($again = function () use ($loop, &$ticks, &$again): void {
+            $ticks++;
+
+            if ($ticks < 3) {
+                $loop->defer($again);
+            }
+        });
+
+        $loop->tick();
+        $this->assertSame(1, $ticks, 'a callback queued during the tick must wait for the next one');
+
+        $loop->tick();
+        $loop->tick();
+        $this->assertSame(3, $ticks);
+    }
+
+    public function testTimersFireInTimeOrderNotInsertionOrder(): void
+    {
+        $loop = Loop::get();
+        $order = [];
+
+        $loop->delay(0.03, function () use (&$order): void {
+            $order[] = 'late';
+        });
+        $loop->delay(0.01, function () use (&$order): void {
+            $order[] = 'early';
+        });
+
+        $loop->run();
+
+        $this->assertSame(['early', 'late'], $order);
+    }
+
+    public function testATurnRunsWhatIsReadyAndDoesNotWaitForATimer(): void
+    {
+        $loop = Loop::get();
+        [$read, $write] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+        fwrite($write, 'payload');
+        $seen = [];
+
+        $loop->defer(function () use (&$seen): void {
+            $seen[] = 'deferred';
+        });
+        $watcher = $loop->onReadable($read, function ($stream) use (&$seen, $loop, &$watcher): void {
+            $seen[] = fread($stream, 1024);
+            $loop->cancel($watcher);
+        });
+        // A second away: `tick()` would sleep it out, a host's run loop cannot.
+        $timer = $loop->delay(1.0, function () use (&$seen): void {
+            $seen[] = 'timer';
+        });
+
+        $started = microtime(true);
+        $loop->turn();
+        $took = microtime(true) - $started;
+        $loop->cancel($timer);
+
+        $this->assertSame(['deferred', 'payload'], $seen);
+        $this->assertLessThan(0.5, $took);
+        $this->assertTrue(is_resource($write));
+    }
+
+    public function testATurnWithOnlyATimerPendingReturnsAtOnceAndFiresItOnceDue(): void
+    {
+        $loop = Loop::get();
+        $fired = 0;
+        $loop->delay(0.02, function () use (&$fired): void {
+            $fired++;
+        });
+
+        $started = microtime(true);
+        $loop->turn();
+        $took = microtime(true) - $started;
+        $this->assertSame(0, $fired);
+        $this->assertLessThan(0.015, $took);
+
+        usleep(25_000);
+        $loop->turn();
+        $this->assertSame(1, $fired);
+        $this->assertTrue($loop->isIdle());
+    }
+
+    public function testReadableFiresOnTheWatcherThatOwnsTheStream(): void
+    {
+        $loop = Loop::get();
+        // Both peers must stay in scope: drop one and it is garbage collected, which
+        // puts the surviving end at EOF and makes it permanently "readable".
+        [$idleRead, $idlePeer] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+        [$busyRead, $busyWrite] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+        fwrite($busyWrite, 'payload');
+
+        $fired = [];
+
+        $idleWatcher = $loop->onReadable($idleRead, function () use (&$fired): void {
+            $fired[] = 'idle';
+        });
+        $busyWatcher = $loop->onReadable($busyRead, function ($stream) use (&$fired, $loop, &$busyWatcher): void {
+            $fired[] = fread($stream, 1024);
+            $loop->cancel($busyWatcher);
+        });
+
+        // The busy watcher cancels itself, then nothing is left but the idle one.
+        $loop->tick();
+        $loop->cancel($idleWatcher);
+
+        $this->assertSame(['payload'], $fired);
+        $this->assertTrue(is_resource($idlePeer));
+    }
+
+    public function testAnIdKeptFromADroppedLoopCancelsNothingOnTheNextOne(): void
+    {
+        // A test drops the loop; something that outlived it — a destructor run late by the GC, a
+        // static — cancels the id it kept. Per-loop ids restarted at 0, so that id named the new
+        // loop's timer of the same number: a root coroutine's `delay()`, which then never woke.
+        $stale = Loop::get()->delay(60.0, static fn () => null);
+        Loop::reset();
+
+        $fired = false;
+        $fresh = Loop::get()->delay(0.0, static function () use (&$fired): void {
+            $fired = true;
+        });
+        $this->assertNotSame($stale, $fresh);
+
+        Loop::get()->cancel($stale);
+        Loop::get()->run();
+        $this->assertTrue($fired);
+    }
+
+    public function testCancelDisarmsAWatcherBeforeItFires(): void
+    {
+        $loop = Loop::get();
+        $fired = false;
+
+        $watcher = $loop->delay(0.001, function () use (&$fired): void {
+            $fired = true;
+        });
+        $loop->cancel($watcher);
+        $loop->run();
+
+        $this->assertFalse($fired);
+        $this->assertTrue($loop->isIdle());
+    }
+
+    public function testIsIdleTracksOutstandingWork(): void
+    {
+        $loop = Loop::get();
+        $this->assertTrue($loop->isIdle());
+
+        $watcher = $loop->delay(10.0, function (): void {
+        });
+        $this->assertFalse($loop->isIdle());
+
+        $loop->cancel($watcher);
+        $this->assertTrue($loop->isIdle());
+    }
+
+    public function testStopEndsRunEvenWithWorkOutstanding(): void
+    {
+        $loop = Loop::get();
+        $ran = 0;
+
+        $loop->delay(0.001, function () use ($loop, &$ran): void {
+            $ran++;
+            $loop->stop();
+        });
+        $loop->delay(60.0, function () use (&$ran): void {
+            $ran++;
+        });
+
+        $loop->run();
+
+        $this->assertSame(1, $ran);
+        $this->assertFalse($loop->isIdle(), 'the 60s timer is still armed');
+    }
+
+    public function testASignalDuringSelectDoesNotKillTheLoop(): void
+    {
+        if (!function_exists('pcntl_alarm') || !function_exists('pcntl_signal')) {
+            self::markTestSkipped('needs ext-pcntl');
+        }
+
+        $loop = Loop::get();
+        pcntl_async_signals(true);
+        $signals = 0;
+        pcntl_signal(SIGALRM, function () use (&$signals): void {
+            $signals++;
+        });
+
+        [$stream, $peer] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+        $loop->onReadable($stream, function (): void {
+        });
+
+        // SIGALRM stands in for SIGWINCH: any signal interrupts a blocked select() the
+        // same way, and pcntl_alarm() needs no fork — a forked child would run this
+        // process's shutdown handlers on exit and corrupt the test report.
+        // pcntl_alarm() takes whole seconds, hence the deliberately slow test.
+        pcntl_alarm(1);
+        $loop->delay(10.0, function (): void {
+        });
+
+        $started = microtime(true);
+        $loop->tick();
+        $elapsed = microtime(true) - $started;
+
+        $this->assertSame(1, $signals);
+        $this->assertTrue($elapsed < 5.0, 'tick() returned on EINTR rather than waiting out the 10s timer');
+        $this->assertTrue(is_resource($peer));
+
+        pcntl_signal(SIGALRM, SIG_DFL);
+    }
+
+    public function testAWatcherOnAClosedStreamNamesItself(): void
+    {
+        $loop = Loop::get();
+        [$stream, $peer] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+        $watcher = $loop->onReadable($stream, function (): void {
+        });
+        fclose($stream);
+
+        $this->assertThrows(AsyncError::class, fn () => $loop->tick(), "Reader {$watcher} watches a closed stream");
+        $this->assertTrue(is_resource($peer));
+    }
+
+    public function testCancellingAWatcherAfterItsStreamWasClosedIsSafe(): void
+    {
+        $loop = Loop::get();
+        [$stream, $peer] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+        $watcher = $loop->onReadable($stream, function (): void {
+        });
+
+        fclose($stream);
+        $loop->cancel($watcher);
+        $loop->tick();
+
+        $this->assertTrue($loop->isIdle());
+        fclose($peer);
+    }
+
+    public function testAnEmptyRegularFileIsReportedReadableAtEof(): void
+    {
+        $loop = Loop::get();
+        $file = tmpfile();
+        $this->assertIsResource($file);
+        $fired = false;
+
+        $id = $loop->onReadable($file, static function () use ($loop, &$id, &$fired): void {
+            $fired = true;
+            $loop->cancel($id);
+        });
+        $guard = $loop->delay(0.5, static fn () => $loop->stop());
+
+        try {
+            $loop->run();
+        } finally {
+            $loop->cancel($guard);
+            fclose($file);
+        }
+
+        $this->assertTrue($fired);
+    }
+
+    public function testAnUnpollableDeviceStreamIsReadableAndDoesNotSpinOnceCancelled(): void
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            self::markTestSkipped('Skip on Windows');
+        }
+
+        $loop = Loop::get();
+        $device = fopen(PHP_OS_FAMILY === 'Linux' ? '/dev/urandom' : '/dev/null', 'r');
+        $this->assertIsResource($device);
+        $fired = false;
+
+        $before = getrusage();
+
+        try {
+            $id = $loop->onReadable($device, static function () use ($loop, &$id, &$fired): void {
+                $fired = true;
+                $loop->cancel($id);
+            });
+            $loop->delay(0.15, static function () use ($loop, $id): void {
+                $loop->cancel($id);
+            });
+            $loop->run();
+        } finally {
+            fclose($device);
+        }
+
+        $after = getrusage();
+        $cpu = ($after['ru_utime.tv_sec'] - $before['ru_utime.tv_sec']) * 1_000_000
+            + ($after['ru_utime.tv_usec'] - $before['ru_utime.tv_usec']);
+
+        $this->assertTrue($fired);
+        $this->assertLessThan(50_000, $cpu);
+    }
+
+    public function testWithNoHandlerAThrowStillEscapesTheLoop(): void
+    {
+        // The default, and every test in this suite was written against it: a library that
+        // swallows by itself is the silent fallback this project forbids.
+        Loop::get()->defer(static fn () => throw new RuntimeException('boom'));
+
+        $problem = $this->assertThrows(RuntimeException::class, fn () => Loop::get()->run());
+
+        $this->assertSame('boom', $problem->getMessage());
+    }
+
+    public function testAThrowOutOfOneDeferredCallbackDoesNotLoseTheOnesQueuedBehindIt(): void
+    {
+        // `runQueue()` takes a snapshot and walks it; a throw out of the second of three used to
+        // drop the third on the floor. Found through `McpClient`: the root fiber failing on a
+        // timeout and the in-memory transport's deferred delivery of `notifications/cancelled`
+        // were in the same snapshot, and the server never heard that the request was cancelled.
+        $ran = [];
+        Loop::get()->defer(static function () use (&$ran): void {
+            $ran[] = 'first';
+        });
+        Loop::get()->defer(static fn () => throw new RuntimeException('boom'));
+        Loop::get()->defer(static function () use (&$ran): void {
+            $ran[] = 'third';
+        });
+
+        $this->assertThrows(RuntimeException::class, fn () => Loop::get()->tick());
+        $this->assertSame(['first'], $ran, 'the throw stops this tick');
+
+        Loop::get()->tick();
+        $this->assertSame(['first', 'third'], $ran, 'and the rest run on the next one');
+    }
+
+    #[DataProvider('everyKindOfCallback')]
+    public function testAHandlerTakesAThrowFromAnyCallbackAndTheLoopCarriesOn(string $kind): void
+    {
+        // All four, because a wrapper on three of them is the shape this repository keeps
+        // finding: deferred, timer, readable and writable are one accident four ways.
+        $seen = [];
+        Loop::get()->setErrorHandler(static function (Throwable $error) use (&$seen): void {
+            $seen[] = $error->getMessage();
+        });
+
+        $thrower = static fn () => throw new RuntimeException("from a {$kind}");
+        $pair = null;
+
+        if ($kind === 'deferred callback') {
+            Loop::get()->defer($thrower);
+        } elseif ($kind === 'timer') {
+            Loop::get()->delay(0.0, $thrower);
+        } else {
+            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+            $id = '';
+
+            // Cancelled from inside, before the throw: a watcher left armed fires on every tick
+            // and the loop would never run out of work.
+            $callback = static function () use ($thrower, &$id): void {
+                Loop::get()->cancel($id);
+                $thrower();
+            };
+
+            if ($kind === 'readable watcher') {
+                fwrite($pair[1], 'x');
+                $id = Loop::get()->onReadable($pair[0], $callback);
+            } else {
+                $id = Loop::get()->onWritable($pair[0], $callback);
+            }
+        }
+
+        // `run()` returning at all is the assertion: it cannot, if the throw escaped its tick.
+        Loop::get()->run();
+
+        $this->assertSame(["from a {$kind}"], $seen);
+
+        foreach (is_array($pair) ? $pair : [] as $stream) {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function everyKindOfCallback(): array
+    {
+        return [
+            'deferred callback' => ['deferred callback'],
+            'timer' => ['timer'],
+            'readable watcher' => ['readable watcher'],
+            'writable watcher' => ['writable watcher'],
+        ];
+    }
+
+    public function testTheSameFailureEveryFrameIsOneLineAndNotOnePerFrame(): void
+    {
+        // What the interactive mode's handler is deduplicating, stated where the mechanism is:
+        // a `render()` that throws throws again next tick, so a handler that reports every time
+        // fills the transcript with the same line. `Loop` hands over every throw — that is its
+        // job — and the caller decides; this pins that it really does hand over every one.
+        $seen = 0;
+        Loop::get()->setErrorHandler(static function () use (&$seen): void {
+            $seen++;
+        });
+
+        foreach (range(1, 3) as $ignored) {
+            Loop::get()->defer(static fn () => throw new RuntimeException('the same thing'));
+        }
+
+        Loop::get()->run();
+
+        $this->assertSame(3, $seen);
+    }
+
+    public function testWaitingOnATimerWithNoStreamsSleepsRatherThanSpinning(): void
+    {
+        // `stream_select()` cannot wait on nothing, so with timers and no watchers the wait is
+        // a `usleep()`. Deleting it leaves a **busy-wait**: every callback still fires at the
+        // right moment and the wall clock is identical, so nothing about the output can tell
+        // the two apart — measured, 0.150s either way. What differs is the CPU: 0.1ms asleep
+        // against 134ms spinning, which on a retry countdown or a `Process::runAsync()` poll
+        // is a core at 100% for as long as the wait lasts.
+        Loop::get()->delay(0.15, static fn () => null);
+
+        $before = getrusage();
+        $wall = microtime(true);
+        Loop::get()->run();
+        $after = getrusage();
+
+        $elapsed = microtime(true) - $wall;
+        $cpu = ($after['ru_utime.tv_sec'] - $before['ru_utime.tv_sec']) * 1_000_000
+            + ($after['ru_utime.tv_usec'] - $before['ru_utime.tv_usec']);
+
+        // The timer really was waited for, so this is not passing by returning early.
+        $this->assertGreaterThan(0.1, $elapsed);
+        // Generous by three orders of magnitude against the 134ms a spin costs.
+        $this->assertLessThan(50_000, $cpu, 'the wait burned CPU, so it was a spin and not a sleep');
+    }
+
+    public function testAStallIsReportedWithWhereTheCoroutineWasHeld(): void
+    {
+        $stalls = [];
+        Loop::get()->watchStalls(static function (float $seconds, string $callback, ?string $from, ?string $at) use (&$stalls): void {
+            $stalls[] = [$seconds, $callback, $from, $at];
+        }, 0.1);
+
+        try {
+            \Owner888\Async\Async::run(static function (): void {
+                \Owner888\Async\Async::delay(0.01);
+                usleep(150_000); // the slow code, between two suspensions
+                \Owner888\Async\Async::delay(0.01);
+                usleep(10_000); // quick: not reported
+                \Owner888\Async\Async::delay(0.01);
+            });
+        } finally {
+            Loop::get()->watchStalls(null);
+        }
+
+        $this->assertCount(1, $stalls);
+        [$seconds, , $from, $at] = $stalls[0];
+        $this->assertGreaterThanOrEqual(0.15, $seconds);
+        $this->assertStringContainsString('LoopTest.php:', (string) $from);
+        $this->assertStringContainsString('LoopTest.php:', (string) $at);
+        $this->assertNotSame($from, $at);
+    }
+
+    public function testAStallSaysWhereTheCoroutineItResumedHadStoppedAndNotAnothers(): void
+    {
+        $stalls = [];
+        Loop::get()->watchStalls(static function (float $seconds, string $callback, ?string $from, ?string $at, array $runtime) use (&$stalls): void {
+            $stalls[] = [$callback, $from, $at, $runtime];
+        }, 0.1);
+
+        try {
+            \Owner888\Async\Async::run(static function (): void {
+                // Something else waiting, suspended most recently of all when the slow one starts.
+                $other = \Owner888\Async\Async::spawn(static fn () => \Owner888\Async\Async::delay(0.3));
+                \Owner888\Async\Async::spawn(static function (): void {
+                    usleep(150_000); // a coroutine slow from its very start
+                    \Owner888\Async\Async::delay(0.01);
+                })->await();
+                $other->await();
+            });
+        } finally {
+            Loop::get()->watchStalls(null);
+        }
+
+        $this->assertCount(1, $stalls);
+        [$callback, $from, $at, $runtime] = $stalls[0];
+        $this->assertMatchesRegularExpression('/^Async\.php:\d+ → LoopTest\.php:\d+$/', $callback);
+        // Its start, not resumed from anything — once this said the other coroutine's await.
+        $this->assertNull($from);
+        $this->assertStringContainsString('LoopTest.php:', (string) $at);
+        $this->assertSame(['gcRuns', 'gcSeconds', 'memory'], array_keys($runtime));
+        $this->assertGreaterThan(0, $runtime['memory']);
+    }
+
+        public function testAStalledCoroutineStartIsNamedAfterWhatTheCoroutineRuns(): void
+    {
+        $stalls = [];
+        Loop::get()->watchStalls(static function (float $seconds, string $callback) use (&$stalls): void {
+            $stalls[] = $callback;
+        }, 0.1);
+
+        try {
+            \Owner888\Async\Async::run(static function (): void {
+                // Slow before its first suspension: the stall is the coroutine's start.
+                \Owner888\Async\Async::spawn(static function (): void {
+                    usleep(150_000);
+                })->await();
+            });
+        } finally {
+            Loop::get()->watchStalls(null);
+        }
+
+        $this->assertCount(1, $stalls);
+        $this->assertMatchesRegularExpression('/^Async\.php:\d+ → LoopTest\.php:\d+$/', $stalls[0]);
+    }
+
+    public function testASleepIsToldOnceWithHowLongItLasted(): void
+    {
+        $loop = Loop::get();
+        $behind = 0.0;
+        $loop->useMonotonicClock(static function () use (&$behind): float {
+            return hrtime(true) / 1e9 - $behind;
+        });
+        $told = [];
+        $loop->onSleep(static function (float $slept) use (&$told): void {
+            $told[] = $slept;
+        });
+
+        $loop->delay(0.02, static function () use (&$behind): void {
+            $behind = 90.0;
+        });
+        $loop->delay(0.05, static fn () => null);
+        $loop->delay(0.08, static fn () => null);
+        $loop->run();
+
+        $this->assertCount(1, $told);
+        $this->assertEqualsWithDelta(90.0, $told[0], 1.0);
+    }
+
+    public function testAPollWaitsNoLongerThanAFewSecondsWhateverTheTimer(): void
+    {
+        // A sleep is only noticed when a poll returns; a poll that waited out a five-minute timer
+        // on a clock that does not count the sleep is what kept a run standing after the lid opened.
+        $loop = Loop::get();
+        $loop->delay(300.0, static fn () => null);
+        $timeout = (new \ReflectionMethod($loop, 'pollTimeout'))->invoke($loop);
+
+        $this->assertLessThanOrEqual(5.0, $timeout);
+    }
+}

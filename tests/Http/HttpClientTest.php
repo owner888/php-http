@@ -1,0 +1,560 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Owner888\Http\Test\Http;
+
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\TestCase;
+use Owner888\Http\Http1Pool;
+use Owner888\Http\HttpClient;
+use Owner888\Http\HttpError;
+use Owner888\Http\Request;
+use Owner888\Async\AbortController;
+use Owner888\Async\AbortError;
+use Owner888\Async\Async;
+use Owner888\Async\Loop;
+use Owner888\Async\SocketError;
+use Owner888\Http\Test\AssertsThrows;
+use Owner888\Http\Test\CannedServer;
+use Owner888\Http\Test\KeepAliveServer;
+
+final class HttpClientTest extends TestCase
+{
+    use AssertsThrows;
+
+    private CannedServer $server;
+
+    #[\Override]
+    protected function setUp(): void
+    {
+        Loop::reset();
+        $this->server = new CannedServer();
+    }
+
+    #[\Override]
+    protected function tearDown(): void
+    {
+        HttpClient::useIdleTimeout(HttpClient::DEFAULT_IDLE_TIMEOUT);
+        Http1Pool::clear();
+    }
+
+    public function testAGzippedResponseIsReadAsItWasBeforeTheServerCompressedIt(): void
+    {
+        $plain = str_repeat('{"candle":[1700000000000,"1936.0","1939.0"]}', 400);
+        $gzipped = (string) gzencode($plain, 6);
+        $url = $this->server->start([
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: " . strlen($gzipped) . "\r\n\r\n" . $gzipped,
+        ]);
+
+        $result = Async::run(static function () use ($url): array {
+            $response = (new HttpClient())->send(new Request('GET', $url, ['Accept-Encoding' => 'gzip']));
+
+            return [$response->header('content-encoding'), $response->header('content-length'), $response->header('content-type'), $response->body->all()];
+        });
+
+        $this->assertSame([null, null, 'application/json', $plain], $result);
+        $this->assertStringContainsString("accept-encoding: gzip\r\n", strtolower($this->server->received()));
+    }
+
+    public function testARequestThatDoesNotAskForGzipStillAsksForIdentity(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"]);
+
+        $body = Async::run(static fn (): string => (new HttpClient())->send(new Request('GET', $url))->body->all());
+
+        $this->assertSame('ok', $body);
+        $this->assertStringContainsString("accept-encoding: identity\r\n", strtolower($this->server->received()));
+    }
+
+    public function testAGzippedBodyCutShortIsAnErrorNotAShorterBody(): void
+    {
+        $gzipped = substr((string) gzencode(str_repeat('abcdefgh', 4000), 6), 0, 60);
+        $url = $this->server->start([
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: " . strlen($gzipped) . "\r\n\r\n" . $gzipped,
+        ]);
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn (): string => (new HttpClient())->send(new Request('GET', $url, ['accept-encoding' => 'gzip']))->body->all()),
+            'in the middle of a gzip-compressed body',
+        );
+    }
+
+    public function testBytesThatAreNotGzipAreAnErrorThatSaysSo(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 12\r\n\r\nnot gzip !!!"]);
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn (): string => (new HttpClient())->send(new Request('GET', $url, ['accept-encoding' => 'gzip']))->body->all()),
+            'not the gzip it says it is',
+        );
+    }
+
+    public function testReadsStatusHeadersAndBody(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"ok\":true}\r\n"]);
+
+        $result = Async::run(static function () use ($url): array {
+            $response = (new HttpClient())->send(new Request('GET', $url));
+
+            return [$response->status, $response->reason, $response->header('content-type'), $response->body->all()];
+        });
+
+        $this->assertSame(200, $result[0]);
+        $this->assertSame('OK', $result[1]);
+        $this->assertSame('application/json', $result[2]);
+        $this->assertSame("{\"ok\":true}\r\n", $result[3]);
+    }
+
+    public function testSendsAWellFormedRequest(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"]);
+
+        Async::run(static function () use ($url): void {
+            (new HttpClient())->send(new Request(
+                'POST',
+                $url . 'v1/messages?beta=true',
+                ['X-Api-Key' => 'secret', 'Content-Type' => 'application/json'],
+                '{"model":"x"}',
+            ))->body->all();
+        });
+
+        $head = $this->server->receivedHead();
+
+        $this->assertStringContainsString('POST /v1/messages?beta=true HTTP/1.1', $head);
+        $this->assertStringContainsString('x-api-key: secret', $head);
+        $this->assertStringContainsString('content-length: 13', $head);
+        // The connection is kept for the next request, so nothing asks for it to be closed.
+        $this->assertStringNotContainsString('connection:', $head);
+        // Nothing here decompresses, so the server must not be left to decide.
+        $this->assertStringContainsString('accept-encoding: identity', $head);
+        $this->assertStringContainsString('{"model":"x"}', $this->server->received());
+    }
+
+    public function testJoinsRepeatedHeaders(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 0\r\n\r\n"]);
+
+        $header = Async::run(static function () use ($url): ?string {
+            $response = (new HttpClient())->send(new Request('GET', $url));
+            $response->body->all();
+
+            return $response->header('set-cookie');
+        });
+
+        $this->assertSame('a=1, b=2', $header);
+    }
+
+    public function testStreamsAChunkedBodyAsItArrives(): void
+    {
+        $url = $this->server->start([
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "5\r\nHello\r\n",
+            "6\r\n world\r\n",
+            "0\r\n\r\n",
+        ]);
+
+        $pieces = Async::run(static function () use ($url): array {
+            $response = (new HttpClient())->send(new Request('GET', $url));
+            $seen = [];
+
+            foreach ($response->body as $piece) {
+                $seen[] = $piece;
+            }
+
+            return $seen;
+        });
+
+        $this->assertSame(['Hello', ' world'], $pieces);
+    }
+
+    public function testReadsABodyThatEndsWhenTheConnectionCloses(): void
+    {
+        // No Content-Length and no chunking: the hang-up is the only frame marker.
+        $url = $this->server->start(["HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n", 'no length header here']);
+
+        $body = Async::run(static fn (): string => (new HttpClient())->send(new Request('GET', $url))->body->all());
+
+        $this->assertSame('no length header here', $body);
+    }
+
+    public function testRejectsAMalformedStatusLine(): void
+    {
+        $url = $this->server->start(["I am not HTTP\r\n\r\n"]);
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn () => (new HttpClient())->send(new Request('GET', $url))),
+            'Malformed status line',
+        );
+    }
+
+    public function testABodyShorterThanPromisedIsAnError(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", 'only twelve']);
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(
+                static fn () => (new HttpClient())->send(new Request('GET', $url))->body->all(),
+            ),
+            'of 100 promised bytes',
+        );
+    }
+
+    public function testAbortingStopsTheBodyMidStream(): void
+    {
+        $url = $this->server->start([
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "5\r\nHello\r\n",
+            // …and then nothing, ever.
+        ], closeAfter: false);
+
+        $error = $this->assertThrows(AbortError::class, static function () use ($url): void {
+            Async::run(static function () use ($url): void {
+                $controller = new AbortController();
+                $response = (new HttpClient())->send(new Request('GET', $url), $controller->signal);
+                Loop::get()->delay(0.05, static fn () => $controller->abort('user pressed esc'));
+
+                foreach ($response->body as $piece) {
+                    // Drain: the first chunk arrives, the second never does.
+                }
+            });
+        });
+
+        $this->assertSame('user pressed esc', $error->getMessage());
+    }
+
+    public function testAChunkedBodyStreamsPieceByPiece(): void
+    {
+        $body = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+            . "event: content_block_delta\ndata: {\"text\":\"Hi\"}\n\n";
+
+        $url = $this->server->start([
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            sprintf("%x\r\n%s\r\n", strlen($body), $body),
+            "0\r\n\r\n",
+        ]);
+
+        $joined = Async::run(static function () use ($url): string {
+            $response = (new HttpClient())->send(new Request('GET', $url));
+            $out = '';
+
+            foreach ($response->body as $piece) {
+                $out .= $piece;
+            }
+
+            return $out;
+        });
+
+        $this->assertSame($body, $joined);
+    }
+
+    // ---- following a redirect ----------------------------------------------------
+    //
+    // `follow()` also has four cases in `ToolInstallerTest`, where the method was added
+    // for the download. What is here is what neither of the two callers happened to
+    // exercise, and the rules `follow()`'s own docblock states.
+
+    /**
+     * @param 'GET'|'POST' $method    what the second request should be made with
+     * @param bool         $keepsBody whether the body should still be attached to it
+     */
+    #[DataProvider('redirectsAndWhatTheyDoToTheMethod')]
+    public function testARedirectDecidesWhetherTheMethodAndItsBodySurvive(
+        int $status,
+        string $method,
+        bool $keepsBody,
+    ): void {
+        $target = new CannedServer();
+        $targetUrl = $target->start(["HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"]);
+
+        $url = $this->server->start(
+            ["HTTP/1.1 {$status} Redirect\r\nLocation: {$targetUrl}\r\nContent-Length: 0\r\n\r\n"],
+        );
+
+        $body = Async::run(static fn (): string => (new HttpClient(5.0))
+            ->follow(new Request('POST', $url, ['Content-Type' => 'application/json'], '{"a":1}'))
+            ->body->all());
+
+        $this->assertSame('ok', $body);
+        $this->assertStringContainsString("{$method} / HTTP/1.1", $target->receivedHead());
+
+        if ($keepsBody) {
+            $this->assertStringContainsString('{"a":1}', $target->received());
+            $this->assertStringContainsString('content-length: 7', $target->receivedHead());
+        } else {
+            $this->assertStringNotContainsString('{"a":1}', $target->received());
+            $this->assertStringNotContainsString('content-length:', $target->receivedHead());
+        }
+    }
+
+    /** @return iterable<string, array{int, string, bool}> */
+    public static function redirectsAndWhatTheyDoToTheMethod(): iterable
+    {
+        // What every browser does and every server expects: the first three turn a POST
+        // into a GET, and the two that exist to avoid that keep both method and body.
+        yield '301 moved permanently' => [301, 'GET', false];
+        yield '302 found' => [302, 'GET', false];
+        yield '303 see other' => [303, 'GET', false];
+        yield '307 temporary redirect' => [307, 'POST', true];
+        yield '308 permanent redirect' => [308, 'POST', true];
+    }
+
+    public function testALocationWithNoSlashOnItIsResolvedAgainstTheDirectory(): void
+    {
+        // `Location: real.tar.gz` against `/releases/download/v1/tool.tar.gz` is the
+        // sibling file, not the root — so the server answers every hop with the same
+        // redirect and what is being asserted is where the second request went.
+        $url = $this->server->start(
+            ["HTTP/1.1 302 Found\r\nLocation: real.tar.gz\r\nContent-Length: 0\r\n\r\n"],
+        );
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn () => (new HttpClient(5.0))
+                ->follow(new Request('GET', $url . 'releases/download/v1/tool.tar.gz'))),
+            'Too many redirects',
+        );
+
+        $this->assertStringContainsString(
+            'GET /releases/download/v1/real.tar.gz HTTP/1.1',
+            $this->server->received(),
+        );
+    }
+
+    public function testFiveIsHowManyRedirectsAreFollowedAndNotHowManyRequestsGoOut(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n"]);
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn () => (new HttpClient(5.0))->follow(new Request('GET', $url))),
+            'Too many redirects',
+        );
+
+        // MAX_REDIRECTS is five, so six requests leave: the original and five more.
+        $this->assertSame(6, substr_count($this->server->received(), ' HTTP/1.1'));
+    }
+
+    // ---- the failures that are the caller's fault, and the ones that are the wire's ----
+
+    public function testAUrlWithNoHostIsRefusedByName(): void
+    {
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn () => (new HttpClient())->send(new Request('GET', '/just/a/path'))),
+            'Cannot parse URL: "/just/a/path"',
+        );
+    }
+
+    public function testASchemeThisCannotSpeakIsRefusedByName(): void
+    {
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(
+                static fn () => (new HttpClient())->send(new Request('GET', 'ftp://example.invalid/x')),
+            ),
+            'Unsupported scheme "ftp"',
+        );
+    }
+
+    public function testTheHostHeaderNamesThePortWhenItIsNotTheDefaultOne(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"]);
+        $port = (int) substr($url, (int) strrpos(rtrim($url, '/'), ':') + 1);
+
+        Async::run(static fn () => (new HttpClient())->send(new Request('GET', $url))->body->all());
+
+        // The default-port half of the rule — a bare host for :80 and :443 — needs a
+        // server on one of those ports, which a test cannot bind.
+        $this->assertStringContainsString("host: 127.0.0.1:{$port}", $this->server->receivedHead());
+    }
+
+    public function testAHeaderLineWithNoColonInItIsRefused(): void
+    {
+        $url = $this->server->start(["HTTP/1.1 200 OK\r\nthis line has no colon\r\n\r\n"]);
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn () => (new HttpClient())->send(new Request('GET', $url))),
+            'Malformed header line: "this line has no colon"',
+        );
+    }
+
+    public function testAResponseHeadBiggerThanTheLimitIsRefused(): void
+    {
+        // 80KB of header bytes and no end to them. In 4KB pieces because a single
+        // fwrite that size comes back short — the trap this file's own renderer has.
+        $url = $this->server->start(array_fill(0, 20, str_repeat('x', 4096)));
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn () => (new HttpClient(5.0))->send(new Request('GET', $url))),
+            'Response head exceeds 65536 bytes',
+        );
+    }
+
+    public function testAHeadThatOnlyReachesTheLimitIsTruncatedRatherThanTooBig(): void
+    {
+        // Exactly MAX_HEAD_BYTES and then the hang-up. The size guard must not fire on
+        // the boundary, so what comes back names the truncation — which is also the only
+        // test that reaches the truncation message at all.
+        $url = $this->server->start(array_fill(0, 16, str_repeat('x', 4096)));
+
+        $this->assertThrows(
+            HttpError::class,
+            static fn () => Async::run(static fn () => (new HttpClient(5.0))->send(new Request('GET', $url))),
+            'Connection closed before the response head was complete',
+        );
+    }
+
+    public function testTheIdleTimeoutIsFiveMinutesUnlessTheSettingSaysOtherwise(): void
+    {
+        // Upstream's `DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000`. pig used to give a streaming body
+        // 60 seconds between two reads, so a model that thought for longer than a minute before
+        // its next token failed with "Socket timed out after 60.0s".
+        $this->assertSame(300.0, HttpClient::DEFAULT_IDLE_TIMEOUT);
+        $this->assertSame(300.0, HttpClient::idleTimeout());
+
+        HttpClient::useIdleTimeout(-1);
+        $this->assertSame(0.0, HttpClient::idleTimeout(), 'nothing below 0, which is "disabled"');
+    }
+
+    public function testAClientWithoutATimeoutOfItsOwnWaitsBetweenReadsAsLongAsTheSettingSays(): void
+    {
+        $url = $this->server->start([
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "5\r\nHello\r\n",
+            // …and then nothing, ever.
+        ], closeAfter: false);
+        HttpClient::useIdleTimeout(0.1);
+
+        $this->assertThrows(
+            SocketError::class,
+            static fn () => Async::run(static function () use ($url): void {
+                foreach ((new HttpClient())->send(new Request('GET', $url))->body as $piece) {
+                    // The first chunk arrives; the wait for the second is the idle timeout.
+                }
+            }),
+            'Socket timed out after 0.1s',
+        );
+    }
+    /** @param array{method: string, path: string, headers: array<string, string>, body: string} $request */
+    private static function okFor(array $request): string
+    {
+        return KeepAliveServer::response('answer to ' . $request['path']);
+    }
+
+    public function testASecondRequestUsesTheConnectionTheFirstLeftOpen(): void
+    {
+        $server = new KeepAliveServer(self::okFor(...));
+        $url = $server->start();
+
+        $bodies = Async::run(static function () use ($url): array {
+            $client = new HttpClient();
+
+            return [
+                $client->send(new Request('GET', $url . 'one'))->body->all(),
+                $client->send(new Request('POST', $url . 'two', [], '{}'))->body->all(),
+            ];
+        });
+
+        $this->assertSame(['answer to /one', 'answer to /two'], $bodies);
+        $this->assertSame(1, $server->connections);
+        // Nothing asks for the connection to be closed.
+        $this->assertArrayNotHasKey('connection', $server->requests[0]['headers']);
+    }
+
+    public function testChunkedAndBodilessResponsesLeaveTheConnectionReusable(): void
+    {
+        $server = new KeepAliveServer(static fn (array $request): string => match ($request['path']) {
+            '/chunked' => "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n",
+            '/empty' => "HTTP/1.1 204 No Content\r\n\r\n",
+            '/head' => "HTTP/1.1 200 OK\r\ncontent-length: 5000\r\n\r\n",
+            default => KeepAliveServer::response('last'),
+        });
+        $url = $server->start();
+
+        $bodies = Async::run(static function () use ($url): array {
+            $client = new HttpClient();
+
+            return [
+                $client->send(new Request('GET', $url . 'chunked'))->body->all(),
+                $client->send(new Request('GET', $url . 'empty'))->body->all(),
+                $client->send(new Request('HEAD', $url . 'head'))->body->all(),
+                $client->send(new Request('GET', $url . 'last'))->body->all(),
+            ];
+        });
+
+        $this->assertSame(['Wiki', '', '', 'last'], $bodies);
+        $this->assertSame(1, $server->connections);
+    }
+
+    public function testAConnectionIsNotKeptWhenItsBodyWasNotReadToTheEnd(): void
+    {
+        $server = new KeepAliveServer(self::okFor(...));
+        $url = $server->start();
+
+        Async::run(static function () use ($url): void {
+            $client = new HttpClient();
+            $client->send(new Request('GET', $url . 'one'))->body->close();
+            $client->send(new Request('GET', $url . 'two'))->body->all();
+        });
+
+        $this->assertSame(2, $server->connections);
+    }
+
+    public function testAConnectionTheServerAskedToCloseIsNotKept(): void
+    {
+        $server = new KeepAliveServer(static fn (array $request): string => KeepAliveServer::response('bye', 200, "connection: close\r\n"));
+        $url = $server->start();
+
+        Async::run(static function () use ($url): void {
+            $client = new HttpClient();
+            $client->send(new Request('GET', $url . 'one'))->body->all();
+            $client->send(new Request('GET', $url . 'two'))->body->all();
+        });
+
+        $this->assertSame(2, $server->connections);
+    }
+
+    public function testAConnectionTheServerClosedWhileItWasIdleIsLeftBehind(): void
+    {
+        $server = new KeepAliveServer(static fn (array $request): string => KeepAliveServer::response('ok'));
+        $url = $server->start();
+
+        $statuses = Async::run(static function () use ($url, $server): array {
+            $client = new HttpClient();
+            $statuses = [$client->send(new Request('GET', $url . 'one'))->status];
+            // The server hangs up on everything it holds; the client finds out when it looks.
+            $server->hangUpOnAll();
+            Async::delay(0.05);
+            $statuses[] = $client->send(new Request('POST', $url . 'two', [], 'x'))->status;
+
+            return $statuses;
+        });
+
+        $this->assertSame([200, 200], $statuses);
+        $this->assertSame(2, $server->connections);
+    }
+
+    public function testAConnectionIsKeptForAsLongAsTheServerSaidItWould(): void
+    {
+        $server = new KeepAliveServer(static fn (array $request): string => KeepAliveServer::response('ok', 200, "keep-alive: timeout=1\r\n"));
+        $url = $server->start();
+
+        Async::run(static function () use ($url): void {
+            $client = new HttpClient();
+            $client->send(new Request('GET', $url . 'one'))->body->all();
+            $client->send(new Request('GET', $url . 'two'))->body->all();
+            // One second, less the one that is kept back for the server's own clock.
+            Async::delay(0.7);
+            $client->send(new Request('GET', $url . 'three'))->body->all();
+        });
+
+        $this->assertSame(2, $server->connections);
+    }
+}
